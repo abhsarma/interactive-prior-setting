@@ -1,0 +1,219 @@
+---
+title: "Analysis of priors identified as weakly informative"
+author: ""
+date: "9/14/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(gamlss)
+library(tidyverse)
+library(tidybayes)
+library(magrittr)
+
+theme_set( theme_light() ) +
+theme_update(
+  panel.border = element_blank(),
+  panel.grid.major = element_line(colour = "#666666", size = 0.1),
+  panel.grid.minor = element_line(colour = "#666666", size = 0.1),    
+)
+```
+
+## Load and wrangle the data
+We load the deidentified data that was created in the document: "Preliminary analysis and comparison of elicited prior distributions across conditions". We then wrangle it for convenience into a suitable data frame.
+
+```{r data}
+data = read_csv( file = "data/prior-setting-study-deidentified-2.csv", 
+                 col_types = list())
+
+priors <- data %>%
+  select( ResponseId, condition, alpha, beta, WIP_alpha:IP_beta ) %>%
+  gather( parameter, prior, alpha, beta ) %>%
+  separate( col = prior, into = c("dist", "mu", "sigma"), sep = "([\\(,\\)])", extra = "drop" ) %>%
+  mutate( 
+    dist = replace(dist, dist == "N", "normal"),
+    dist = replace(dist, dist == "t", "student_t")
+  ) %>%
+  mutate( mu = as.numeric(mu), sigma = as.numeric(sigma) ) %>%
+  drop_na( condition ) %>%
+  mutate( index = seq(1:nrow(.)))
+```
+
+
+## Weakly Informative priors
+We coded the responses of the participants responses in the survey on whether or not they tried to choose a "weakly informative priors". In this document we compare the priors elicited from participants who tried to choose a "weakly informative prior".
+
+
+### Calculating the prior predictive density for $alpha$
+
+In this document we analyse the prior distributions that we have coded as "weakly informative". We look at the data descriptively. 
+
+One interpretation of "weakly informative priors" is that it should predict little or no probability mass for values that are theoretically impossible. Hence, we calculate the prior predictive densities to see the amount of probability mass predicted at different values of the outcome.
+
+
+We calculate the prior predictive distribution by integrating the product of the prior and the likelihood:
+
+$$
+\begin{aligned}
+f(k; \mu, \sigma | alpha) & = \int{ f_{poisson(\lambda)}(k).f_{alpha}(\lambda)d\lambda } \\
+& = \int{ \frac{\lambda^k}{k!} exp(-\lambda) \frac{1}{\lambda\sigma\sqrt{2\pi}}exp( - \frac{(ln \lambda - \mu)^2}{2\sigma^2} } d\lambda \\
+& = \frac{1}{k!\sigma\sqrt{2\pi}}\int{ \lambda^{(k-1)} exp(-\lambda) exp( - \frac{(ln \lambda - \mu)^2}{2\sigma^2} }) d\lambda \\
+\end{aligned}
+$$
+
+We define functions to perform this integration
+
+```{r}
+integrand_alpha_normal <- function(x, mu, sigma, k) {
+  (exp( k*log(x) - x ) / factorial(k)) * dnorm( log(x), mu, sigma) * abs(1/x)
+}
+
+#gen.Family("TF")
+integrand_alpha_student_t <- function(x, mu, sigma, k, nu = 3) {
+  (exp( k*log(x) - x ) / factorial(k)) * gamlss.dist::dTF( log(x) , mu, sigma, nu) * abs(1/x)
+}
+
+integrand_alpha_student_t <- function(x, mu, sigma, k, nu = 3) {
+  (exp((k-1)*log(x) - x )) * exp( -(log(x) - mu)^2/(2*sigma^2) )
+}
+
+integrate_t_dist <- function(mu, sigma, k, nu = 3) {
+   integrate( integrand_alpha_student_t, lower = 0, upper = Inf, mu, sigma, k )$value * (1/(factorial(k) * sigma * sqrt(2*pi)))
+}
+```
+
+We calculate the prior predictive densities for the priors:
+
+```{r}
+ppd.alpha.normal <- priors %>%
+  filter( parameter == "alpha" & dist == "normal" ) %>%
+  mutate( 
+    k = list(seq(0, 128, by = 1))
+  ) %>%
+  unnest(k) %>%
+  mutate(
+    density = pmap_dbl( list(mu, sigma, k), ~integrate( integrand_alpha_normal, lower = 0, upper = Inf, mu = ..1, sigma = ..2, k = ..3, rel.tol = 1e-15)$value )
+  )
+
+ppd.alpha.student_t <- priors %>%
+  filter( parameter == "alpha" & dist == "student_t" )  %>%
+  mutate( 
+    k = list(seq(0, 128, by = 1))
+  ) %>%
+  unnest(k) %>%
+  mutate(
+    density = pmap_dbl( list(mu, sigma, k), ~ integrate_t_dist(..1, ..2, ..3))
+  )
+
+ppd.alpha <- rbind(ppd.alpha.normal, ppd.alpha.student_t)
+```
+
+We visualize the histograms of the probability mass predicted by the elicited priors in the interval [0, 128].
+We dont find any differences in the priors chosen by the participants across the different conditions.
+
+```{r}
+ppd.alpha %>%
+  select(-k) %>%
+  group_by( ResponseId, mu, sigma, parameter, dist, condition ) %>%
+  summarise( density = sum(density) ) %>%
+  ggplot() +
+  geom_histogram(aes(density), breaks = seq(0.8, 1, 0.025)) +
+  scale_y_continuous(breaks = seq(0, 12, by = 2)) +
+  facet_grid( . ~ condition )
+```
+
+We then visualise the probability density of the priors on $\alpha$ coded as "weakly informative", on the parameter scale
+
+```{r, fig.height = 3, fig.width = 9}
+get_density <- function( dist, mu, sigma, grid) {
+  if (dist == "normal") {
+    dnorm( grid, mu, sigma )
+  } else if(dist == "student_t") {
+    gamlss.dist::dTF( grid, mu, sigma, nu = 3)
+  } else {
+    NA
+  }
+}
+
+plot.wip.alpha <- priors %>%
+  filter( (WIP_beta == TRUE | WIP_alpha == TRUE) & parameter == "alpha" ) %>%
+  mutate( 
+    grid = list(seq(-3, 7, by = 0.01))
+  ) %>%
+  mutate(
+    density = pmap( list(grid, mu, sigma, dist), ~get_density(..4, ..2, ..3, ..1) )
+  ) %>%
+  unnest( grid, density ) %>%
+  filter( density >= 1e-2) %>%
+  ggplot( aes(grid, density, group = index, color = dist) ) +
+  geom_line( size = 1, alpha = 0.5 )
+
+plot.wip.alpha
+```
+
+
+Next, we show the prior predictive densities for the priors on $\alpha$ on the response scale.
+
+```{r}
+ppd.alpha.wip <- ppd.alpha %>% filter( WIP_alpha == TRUE )
+
+plot.wip.alpha.ppd <- ppd.alpha.wip  %>%
+  group_by( ResponseId, mu, sigma, parameter, dist, condition, WIP_alpha ) %>%
+  ggplot() +
+  geom_line(aes(k, density, group = index, color = dist), alpha = 0.5, size = 1) +
+  scale_x_continuous( breaks = seq(0, 128, by = 16))
+
+plot.wip.alpha.ppd
+```
+
+
+Next, we show the histogram of the probability mass the prior predictive density predicts within the interval [0, 128]
+
+```{r wip_ppd_analysis }
+ppd.interval.wip <- ppd.alpha.wip %>%
+  select(-k) %>%
+  group_by( ResponseId, mu, sigma, parameter, dist, condition, WIP_alpha ) %>%
+  summarise( density = sum(density) ) %>%
+  ggplot() +
+  geom_histogram(aes(density), color = "#ffffff", breaks = seq(0.8, 1, 0.025))
+
+ppd.interval.wip
+```
+
+
+
+### Comparing the weakly informative priors for $\beta$
+
+We show the prior predictive densities for the priors on $\beta$ on the response scale.
+
+```{r, priors-beta-wip-response}
+priors.dens.beta <- priors %>% 
+  filter( parameter == "beta" & WIP_beta == TRUE ) %>%
+  mutate( grid = list(seq(-2.5, 2.5, by = 0.01)) ) %>%
+  mutate( density = pmap(list(dist, mu, sigma, grid), ~ get_density(..1, ..2, ..3, ..4)) )
+
+prior.beta.wip <- priors.dens.beta %>%
+  unnest( grid, density, .drop = FALSE) %>%
+  ggplot() +
+  geom_vline( xintercept = 0, alpha = 0.5 ) +
+  geom_line(aes( x = grid, y = density, color = dist, group = ResponseId), alpha = 0.7) +
+  scale_x_continuous( breaks = log(c(0.1, 0.2, 0.4, 0.7, 1, 1.4, 2, 3, 5, 8)), labels = function(x) round(exp(x), 2) )
+
+prior.beta.wip
+```
+
+Next, we show the histogram of the scale values for the priors on $\beta$ that we coded as "weakly informative"
+
+```{r}
+priors.beta.hist.wip <- priors %>%
+  filter( WIP_beta == TRUE & parameter == "beta" ) %>%
+  ggplot() +
+  geom_histogram( aes(sigma), color = "#ffffff", breaks = seq(0.2, 1, by = 0.1) )
+
+priors.beta.hist.wip
+```
+
+
+
+
